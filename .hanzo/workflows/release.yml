@@ -60,24 +60,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "probe=ghcr.io/hanzoai/aml:${V}" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker-container
-          driver-opts: network=host
-
-      - name: Build the engine image (embedded UI), load for smoke
-        uses: docker/build-push-action@v6
-        with:
-          context: engine
-          file: engine/Dockerfile
-          platforms: linux/amd64
-          build-args: |
-            VERSION=${{ steps.pin.outputs.version }}
-            GITHUB_TOKEN=${{ secrets.GHCR_TOKEN }}
-          load: true
-          push: false
-          provenance: false
-          tags: ${{ steps.meta.outputs.probe }}
+      - name: Build the engine image (embedded UI) with plain docker
+        # Plain docker build against the runner daemon; the buildx container driver
+        # nests buildkit in DinD and fails at setup on this runner.
+        run: |
+          set -euo pipefail
+          docker build --build-arg VERSION=${{ steps.pin.outputs.version }}             --build-arg GITHUB_TOKEN=${{ secrets.GHCR_TOKEN }}             -t ${{ steps.meta.outputs.probe }} -f engine/Dockerfile engine
 
       - name: Smoke — serves, and refuses an unauthenticated read
         # AML_CLIENT_ID is required (it is the audience every token is pinned to);
