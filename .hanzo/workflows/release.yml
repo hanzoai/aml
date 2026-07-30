@@ -1,0 +1,141 @@
+name: Release
+# Builds the Hanzo AML image from the pinned luxfi/aml engine, on the native
+# runner (git.hanzo.ai → git-runner, hanzo-build-linux-amd64). Nothing here
+# depends on GitHub: the engine source is cloned from git.hanzo.ai, the modules
+# resolve through our proxy, and the image publishes to our registries.
+#
+# The engine is the canonical implementation; this repo is a thin brand wrapper
+# that pins a version and owns the Hanzo registry namespace. The image is built
+# from the engine's own Dockerfile (which builds the embedded operator UI), so
+# there is one build definition, in the engine, not a fork of it here.
+#
+# Dual-publish: ghcr.io/hanzoai/aml is the published copy, oci.hanzo.ai/hanzoai/aml
+# is our sovereign copy so a deploy never depends on a third party. Both use the
+# hanzoai org's own credentials.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: hanzo-build-linux-amd64
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned engine version
+        id: pin
+        run: echo "version=$(tr -d ' \n\r' < ENGINE_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the engine source at the pinned version
+        # From git.hanzo.ai, not GitHub — the canonical source is ours.
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.pin.outputs.version }}" \
+            http://hanzo-git.hanzo.svc/luxfi/aml engine
+          echo "engine at $(git -C engine rev-parse --short HEAD)"
+
+      - name: Compute tags
+        id: meta
+        run: |
+          set -euo pipefail
+          V="${{ steps.pin.outputs.version }}"
+          SHA="sha-${GITHUB_SHA:0:7}"
+          {
+            echo "ghcr<<EOF"
+            echo "ghcr.io/hanzoai/aml:${V}"
+            echo "ghcr.io/hanzoai/aml:${SHA}"
+            echo "EOF"
+            echo "oci<<EOF"
+            echo "oci.hanzo.ai/hanzoai/aml:${V}"
+            echo "oci.hanzo.ai/hanzoai/aml:${SHA}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "probe=ghcr.io/hanzoai/aml:${V}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - name: Build the engine image (embedded UI), load for smoke
+        uses: docker/build-push-action@v6
+        with:
+          context: engine
+          file: engine/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ steps.pin.outputs.version }}
+            GITHUB_TOKEN=${{ secrets.GHCR_TOKEN }}
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ steps.meta.outputs.probe }}
+
+      - name: Smoke — serves, and refuses an unauthenticated read
+        # AML_CLIENT_ID is required (it is the audience every token is pinned to);
+        # ingest needs a brand-issued bearer this smoke cannot mint, so it checks
+        # the two facts that need no token.
+        run: |
+          set -euo pipefail
+          img="${{ steps.meta.outputs.probe }}"
+          cid=$(docker run -d \
+            -e AML_TENANT_HEADER=X-Org-Id \
+            -e AML_CLIENT_ID=aml-hanzo-smoke \
+            -e AML_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
+            -p 127.0.0.1:8799:8090 "$img")
+          trap 'docker logs "$cid" | tail -60; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          ready=""
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8799/v1/aml/health; then ready=1; break; fi
+            sleep 2
+          done
+          [ -n "$ready" ] || { echo "::error::amld never answered /v1/aml/health"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/v1/aml/cases)
+          [ "$code" = "401" ] || { echo "::error::unauthenticated read returned $code, want 401"; exit 1; }
+          echo "serves, and refuses an unauthenticated read"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USER }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Push to ghcr.io/hanzoai/aml (canonical published copy)
+        run: |
+          set -euo pipefail
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            docker tag "${{ steps.meta.outputs.probe }}" "$t"; docker push "$t"
+          done <<< "${{ steps.meta.outputs.ghcr }}"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: oci.hanzo.ai
+          username: ${{ secrets.OCI_USER }}
+          password: ${{ secrets.OCI_TOKEN }}
+
+      - name: Mirror to oci.hanzo.ai/hanzoai/aml (sovereign copy)
+        run: |
+          set -euo pipefail
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            docker tag "${{ steps.meta.outputs.probe }}" "$t"; docker push "$t"
+          done <<< "${{ steps.meta.outputs.oci }}"
+
+      - name: Verify the published manifest resolves
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5 6; do
+            if docker manifest inspect "${{ steps.meta.outputs.probe }}" >/dev/null 2>&1; then
+              echo "resolvable"; exit 0; fi
+            echo "not visible yet ($i/6)"; sleep 5
+          done
+          echo "::error::image not pullable after push"; exit 1
