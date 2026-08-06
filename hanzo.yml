@@ -1,0 +1,16 @@
+# Hanzo AML is a brand wrapper: no engine source lives here, only the pinned
+# ENGINE_VERSION of git.hanzo.ai/luxfi/aml plus this deployment's config. The
+# image is built from the engine's own Dockerfile by .hanzo/workflows/release.yml,
+# so there is nothing here for `images:` to point at.
+#
+# Gate: the pin resolves. The single way this repo can be wrong is a version that
+# names no engine tag — and that failure is otherwise invisible until a release
+# build clones nothing and dies far from the commit that caused it.
+test:
+  - name: engine-pin-resolves
+    run: |
+      set -euo pipefail
+      v=$(tr -d ' \n\r' < ENGINE_VERSION)
+      [ -n "$v" ] || { echo "ENGINE_VERSION is empty"; exit 1; }
+      git ls-remote --exit-code --tags https://github.com/luxfi/aml "refs/tags/$v"
+      echo "engine pin $v resolves"
