@@ -71,23 +71,50 @@ jobs:
         # AML_CLIENT_ID is required (it is the audience every token is pinned to);
         # ingest needs a brand-issued bearer this smoke cannot mint, so it checks
         # the two facts that need no token.
+        #
+        # The probe shares THIS job container's network namespace rather than
+        # publishing a port. The step runs inside a job container while the docker
+        # daemon is the runner's own, so `-p 127.0.0.1:…` binds in the runner's
+        # namespace and the loopback here never reaches it — measured, the probe
+        # got no connection at all for sixty seconds while the container logged
+        # "Server started at http://0.0.0.0:8090". Sharing the namespace makes the
+        # two loopbacks the same one, and nothing has to be published.
+        #
+        # The token key is hex from od/tr, not xxd: xxd is not in the runner image,
+        # and inside the argument list that substitution failed quietly to an EMPTY
+        # key rather than failing the step, so the daemon was smoked without the
+        # key it is given in production. It is its own assignment now, so a missing
+        # tool is a failed step.
+        #
+        # This is the engine's own release smoke, which is green on the same runner.
         run: |
           set -euo pipefail
           img="${{ steps.meta.outputs.probe }}"
+
+          self="$(hostname)"
+          docker inspect "$self" >/dev/null 2>&1 \
+            || { echo "::error::cannot resolve this job container ($self) to share its network"; exit 1; }
+
+          key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          [ ${#key} -eq 64 ] || { echo "::error::token key is ${#key} hex chars, want 64"; exit 1; }
+
           cid=$(docker run -d \
             -e AML_TENANT_HEADER=X-Org-Id \
             -e AML_CLIENT_ID=aml-hanzo-smoke \
-            -e AML_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
-            -p 127.0.0.1:8799:8090 "$img")
+            -e AML_TOKEN_KEY="$key" \
+            --network "container:$self" "$img")
           trap 'docker logs "$cid" | tail -60; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
           ready=""
           for i in $(seq 1 30); do
-            if curl -sf -o /dev/null http://127.0.0.1:8799/v1/aml/health; then ready=1; break; fi
+            if curl -sf -o /dev/null http://127.0.0.1:8090/v1/aml/health; then ready=1; break; fi
             sleep 2
           done
           [ -n "$ready" ] || { echo "::error::amld never answered /v1/aml/health"; exit 1; }
-          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/v1/aml/cases)
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/aml/cases)
           [ "$code" = "401" ] || { echo "::error::unauthenticated read returned $code, want 401"; exit 1; }
+
           echo "serves, and refuses an unauthenticated read"
 
       - uses: docker/login-action@v3
