@@ -36,9 +36,20 @@ jobs:
 
       - name: Fetch the engine source at the pinned version
         # From git.hanzo.ai, not GitHub — the canonical source is ours.
+        #
+        # Signed in, because the forge now answers nothing anonymously — public
+        # repo or not, and luxfi/aml is public. The clone died on "could not read
+        # Username for 'http://hanzo-git.hanzo.svc'" the moment that changed.
+        # FORGE_TOKEN is the fleet's credential for reading git.hanzo.ai, and it
+        # travels in a header rather than in the URL, which git echoes verbatim
+        # when a clone fails.
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_TOKEN }}
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${{ steps.pin.outputs.version }}" \
+          [ -n "${FORGE_TOKEN:-}" ] || { echo "::error::FORGE_TOKEN is unset, and the engine source is read from git.hanzo.ai, which serves no anonymous clone"; exit 1; }
+          git -c http.extraheader="Authorization: token ${FORGE_TOKEN}" \
+            clone --depth 1 -q --branch "${{ steps.pin.outputs.version }}" \
             http://hanzo-git.hanzo.svc/luxfi/aml engine
           echo "engine at $(git -C engine rev-parse --short HEAD)"
 
@@ -63,9 +74,14 @@ jobs:
       - name: Build the engine image (embedded UI) with plain docker
         # Plain docker build against the runner daemon; the buildx container driver
         # nests buildkit in DinD and fails at setup on this runner.
+        #
+        # VERSION is the only build-arg the engine's Dockerfile declares: every
+        # dependency comes through the module proxy and the npm registry, so the
+        # build needs no credential and was handed one it never consumed.
         run: |
           set -euo pipefail
-          docker build --build-arg VERSION=${{ steps.pin.outputs.version }}             --build-arg GITHUB_TOKEN=${{ secrets.GHCR_TOKEN }}             -t ${{ steps.meta.outputs.probe }} -f engine/Dockerfile engine
+          docker build --build-arg VERSION="${{ steps.pin.outputs.version }}" \
+            -t "${{ steps.meta.outputs.probe }}" -f engine/Dockerfile engine
 
       - name: Smoke — serves, and refuses an unauthenticated read
         # AML_CLIENT_ID is required (it is the audience every token is pinned to);
